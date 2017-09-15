@@ -139,7 +139,7 @@ namespace all2all {
                 cudaSetDevice(src);
                 for (uint64_t dst_gpu = 0; dst_gpu < num_gpus; ++dst_gpu) {
                     const uint64_t dst = device_ids[dst_gpu];
-                    if (peer_status[src_gpu][dst_gpu] && src != dst)
+                    if (peer_status[src_gpu][dst_gpu] == 2)
                         cudaDeviceDisablePeerAccess(dst);                    
                 }
             } CUERR
