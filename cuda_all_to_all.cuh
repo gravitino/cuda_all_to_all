@@ -507,13 +507,13 @@ namespace all2all {
     template <
         uint64_t num_gpus>
     struct part_hash {
-        template < 
+        template <
             typename index_t> __host__ __device__ __forceinline__
         uint64_t operator()(index_t x) const {
             return uint64_t(x) % (num_gpus+1);
         }
     };
-    
+
     template <
         typename index_t> __device__ __forceinline__
     index_t atomicAggInc(
@@ -548,9 +548,9 @@ namespace all2all {
         const auto thid = blockDim.x*blockIdx.x + threadIdx.x;
 
         for(index_t i = thid; i < len; i += gridDim.x*blockDim.x) {
-            
+
             const value_t value = src[i];
-            
+
             if (part_hash(value) == desired) {
                 const index_t j = atomicAggInc(counter);
                 dst[j] = value;
@@ -582,7 +582,7 @@ namespace all2all {
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(context->get_device_id(gpu));
                 cudaMalloc(&counters_device[gpu], sizeof(cnter_t));
-                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t));
+                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t)*num_gpus);
             } CUERR
         }
 
@@ -598,7 +598,7 @@ namespace all2all {
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(context->get_device_id(gpu));
                 cudaMalloc(&counters_device[gpu], sizeof(cnter_t));
-                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t));
+                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t)*num_gpus);
             } CUERR
         }
 
@@ -635,32 +635,46 @@ namespace all2all {
                         );
                     else return false;
             }
-            
+
+            // initialize the counting atomics with zeroes
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
-                cnter_t offsets[num_gpus] = {0};
                 cudaSetDevice(context->get_device_id(gpu));
-                for (uint64_t part = 0; part < num_gpus; ++part) {
-                    cudaMemsetAsync(counters_device[gpu], 0, sizeof(cnter_t),
-                                    context->get_streams(gpu)[0]);
-                    binary_split<<<128, 1024, 0, context->get_streams(gpu)[0]>>>
-                       (srcs[gpu], dsts[gpu]+offsets[gpu], srcs_lens[gpu],
-                        counters_device[gpu], functor, part+1);
-                    cudaMemcpyAsync(counters_host[gpu], counters_device[gpu],
-                                    sizeof(cnter_t), cudaMemcpyDeviceToHost,
-                                    context->get_streams(gpu)[0]);
-                    cudaStreamSynchronize(context->get_streams(gpu)[0]);              
-                    
-                    offsets[gpu] += counters_host[gpu][0];
-                    table[gpu][part] = counters_host[gpu][0];
-                }            
+                cudaMemsetAsync(counters_device[gpu], 0, sizeof(cnter_t),
+                                context->get_streams(gpu)[0]);
             } CUERR
 
+            // perform warp aggregated compression for each GPU independently
+            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
+                cudaSetDevice(context->get_device_id(gpu));
+                for (uint64_t part = 0; part < num_gpus; ++part) {
+
+                    binary_split<<<256, 1024, 0, context->get_streams(gpu)[0]>>>
+                       (srcs[gpu], dsts[gpu], srcs_lens[gpu],
+                        counters_device[gpu], functor, part+1);
+                    cudaMemcpyAsync(&counters_host[gpu][part],
+                                    &counters_device[gpu][0],
+                                    sizeof(cnter_t), cudaMemcpyDeviceToHost,
+                                    context->get_streams(gpu)[0]);
+
+                }
+            } CUERR
+
+            // this sync is mandatory
             sync();
 
-            for (int i = 0; i < num_gpus; ++i)
-                for (int j = 0; j < num_gpus; ++j)
-                    std::cout << table[i][j] << (j+1==num_gpus ? "\n" : " ");
-            std::cout << std::endl;
+            // recover the partition table from accumulated counters
+            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu)
+                for (uint64_t part = 0; part < num_gpus; ++part)
+                    table[gpu][part] = part == 0 ? counters_host[gpu][part] :
+                                       counters_host[gpu][part] -
+                                       counters_host[gpu][part-1];
+
+            // reset srcs to zero
+            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
+                cudaSetDevice(context->get_device_id(gpu));
+                cudaMemsetAsync(srcs[gpu], 0, sizeof(value_t)*srcs_lens[gpu],
+                                context->get_streams(gpu)[0]);
+            } CUERR
 
             return true;
         }
@@ -716,48 +730,20 @@ namespace all2all {
         template <
             typename value_t,
             typename index_t>
-        bool create_partitions_host(
+        bool create_random_data_host(
             value_t *srcs_host[num_gpus],
-            index_t  srcs_lens[num_gpus],
-            index_t  dsts_lens[num_gpus],
-            index_t table[num_gpus][num_gpus]) const {
+            index_t  srcs_lens[num_gpus]) const {
 
-            // compute prefix sums over the partition table
-            uint64_t h_table[num_gpus][num_gpus+1] = {0}; // horizontal scan
-            uint64_t v_table[num_gpus+1][num_gpus] = {0}; // vertical scan
-
-            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
-                for (uint64_t part = 0; part < num_gpus; ++part) {
-                    h_table[gpu][part+1] = table[gpu][part]+h_table[gpu][part];
-                    v_table[gpu+1][part] = table[gpu][part]+v_table[gpu][part];
-                }
-            }
-
-            // check if src_lens are compatible with partition table
-            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu)
-                if (h_table[gpu][num_gpus] > srcs_lens[gpu])
-                    if (throw_exceptions)
-                        throw std::invalid_argument(
-                            "not enough memory in src_lens,"
-                            "increase security_factor.");
-                    else return false;
-
-            // check if dsts_lens are compatible with partition table
-            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu)
-                if (v_table[num_gpus][gpu] > dsts_lens[gpu])
-                    if (throw_exceptions)
-                        throw std::invalid_argument(
-                            "not enough memory in dsts_lens,"
-                            "increase security_factor.");
-                    else return false;
+            // initialize RNG
+            std::random_device rd;
+            std::mt19937 engine(rd());
+            std::uniform_int_distribution<uint64_t> rho;
 
             // fill the source array according to the partition table
-            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
-                for (uint64_t part = 0; part < num_gpus; ++part)
-                    for (uint64_t i = h_table[gpu][part];
-                         i < h_table[gpu][part+1]; ++i)
-                        srcs_host[gpu][i] = part+1;
-            }
+            for (uint64_t gpu = 0; gpu < num_gpus; ++gpu)
+                for (uint64_t index = 0; index < srcs_lens[gpu]; ++index)
+                    srcs_host[gpu][index] = rho(engine) % (num_gpus+1);
+
 
             return true;
         }
@@ -796,4 +782,3 @@ namespace all2all {
     };
 }
 #endif
-
