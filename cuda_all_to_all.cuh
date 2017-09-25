@@ -505,12 +505,15 @@ namespace all2all {
     };
 
     template <
-        uint64_t num_gpus,
-        typename index_t>
-    uint64_t part_hash(index_t x) {
-        return (*((uint64_t*)(&x))) % num_gpus;
-    }
-
+        uint64_t num_gpus>
+    struct part_hash {
+        template < 
+            typename index_t> __host__ __device__ __forceinline__
+        uint64_t operator()(index_t x) const {
+            return uint64_t(x) % (num_gpus+1);
+        }
+    };
+    
     template <
         typename index_t> __device__ __forceinline__
     index_t atomicAggInc(
@@ -545,7 +548,9 @@ namespace all2all {
         const auto thid = blockDim.x*blockIdx.x + threadIdx.x;
 
         for(index_t i = thid; i < len; i += gridDim.x*blockDim.x) {
+            
             const value_t value = src[i];
+            
             if (part_hash(value) == desired) {
                 const index_t j = atomicAggInc(counter);
                 dst[j] = value;
@@ -555,15 +560,14 @@ namespace all2all {
 
     template <
         uint8_t num_gpus,
-        typename table_t,
         typename cnter_t=uint32_t,
         bool throw_exceptions=true>
     class multisplit_t {
 
         const context_t<num_gpus> * context;
         bool external_context;
-        table_t * table_device[num_gpus];
         cnter_t * counters_device[num_gpus];
+        cnter_t * counters_host[num_gpus];
 
     public:
 
@@ -577,8 +581,8 @@ namespace all2all {
 
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(context->get_device_id(gpu));
-                cudaMalloc(&table_device[gpu], sizeof(table_t)*num_gpus);
                 cudaMalloc(&counters_device[gpu], sizeof(cnter_t));
+                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t));
             } CUERR
         }
 
@@ -593,8 +597,8 @@ namespace all2all {
 
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(context->get_device_id(gpu));
-                cudaMalloc(&table_device[gpu], sizeof(table_t)*num_gpus);
                 cudaMalloc(&counters_device[gpu], sizeof(cnter_t));
+                cudaMallocHost(&counters_host[gpu], sizeof(cnter_t));
             } CUERR
         }
 
@@ -602,7 +606,7 @@ namespace all2all {
 
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(context->get_device_id(gpu));
-                cudaFree(table_device[gpu]);
+                cudaFreeHost(counters_host[gpu]);
                 cudaFree(counters_device[gpu]);
             } CUERR
 
@@ -613,6 +617,7 @@ namespace all2all {
         template <
             typename value_t,
             typename index_t,
+            typename table_t,
             typename funct_t>
         bool execAsync (
             value_t * srcs[num_gpus],
@@ -632,20 +637,30 @@ namespace all2all {
             }
             
             for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
+                cnter_t offsets[num_gpus] = {0};
                 cudaSetDevice(context->get_device_id(gpu));
-                cudaMemsetAsync(table_device[gpu], 0, sizeof(table_t)*num_gpus,
-                                context->get_streams(gpu)[0]);
-                uint64_t offset = 0;
                 for (uint64_t part = 0; part < num_gpus; ++part) {
                     cudaMemsetAsync(counters_device[gpu], 0, sizeof(cnter_t),
                                     context->get_streams(gpu)[0]);
                     binary_split<<<128, 1024, 0, context->get_streams(gpu)[0]>>>
-                       (srcs[gpu], dsts[gpu]+offset, srcs_lens[gpu],
-                        counters_device[gpu], functor, part);
-                                 
-                    offset += table[gpu][part];
+                       (srcs[gpu], dsts[gpu]+offsets[gpu], srcs_lens[gpu],
+                        counters_device[gpu], functor, part+1);
+                    cudaMemcpyAsync(counters_host[gpu], counters_device[gpu],
+                                    sizeof(cnter_t), cudaMemcpyDeviceToHost,
+                                    context->get_streams(gpu)[0]);
+                    cudaStreamSynchronize(context->get_streams(gpu)[0]);              
+                    
+                    offsets[gpu] += counters_host[gpu][0];
+                    table[gpu][part] = counters_host[gpu][0];
                 }            
             } CUERR
+
+            sync();
+
+            for (int i = 0; i < num_gpus; ++i)
+                for (int j = 0; j < num_gpus; ++j)
+                    std::cout << table[i][j] << (j+1==num_gpus ? "\n" : " ");
+            std::cout << std::endl;
 
             return true;
         }

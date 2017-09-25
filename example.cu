@@ -70,7 +70,7 @@ void check (
     all2all::memory_manager_t<num_gpus> memory_manager(&context);
     all2all::point2point_t<num_gpus> point2point(&context);
     all2all::all2all_t<num_gpus> all2all(&context);
-    all2all::multisplit_t<num_gpus, uint64_t> multisplit(&context);
+    all2all::multisplit_t<num_gpus> multisplit(&context);
     all2all::experiment_t<num_gpus> experiment(&context);
 
     // determine lengths of source arrays
@@ -81,7 +81,9 @@ void check (
     // determine lengths of source and destination arrays
     for (uint64_t gpu = 0; gpu < num_gpus; ++gpu) {
         srcs_lens[gpu] = uint64_t(num_gpus*partition_size*security_factor);
+        //srcs_lens[gpu] = (srcs_lens[gpu]+31)/32*32;
         dsts_lens[gpu] = uint64_t(num_gpus*partition_size*security_factor);
+        //dsts_lens[gpu] = (dsts_lens[gpu]+31)/32*32;
     }
 
     // show srcs_lens and dsts_lens
@@ -148,9 +150,9 @@ void check (
 
     BANDWIDTHSTART(multisplit)
     multisplit.execAsync(srcs, srcs_lens, dsts, dsts_lens, table,
-                         all2all::part_hash<num_gpus, value_t>);
+                         all2all::part_hash<num_gpus>());
     multisplit.sync();
-    BANDWIDTHSTOP(multisplit, 1)
+    BANDWIDTHSTOP(multisplit, trans_entries*sizeof(value_t))
 
     BANDWIDTHSTART(all2all)
     if (verbosity > 0)
