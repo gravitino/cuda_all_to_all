@@ -8,11 +8,11 @@
 template <
     uint8_t num_gpus=4,
     uint8_t max_gpus=num_gpus,
-    uint8_t verbosity=1,
+    uint8_t verbosity=2,
     typename value_t=double>
 void check (
     uint64_t * device_ids_ = 0,
-    uint64_t   batch_size=1UL<<28) {
+    uint64_t   batch_size=1UL<<4) {
 
     static_assert(num_gpus <= max_gpus,
                   "choose less or equal GPUs out of the existing ones.");
